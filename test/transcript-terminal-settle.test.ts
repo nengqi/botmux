@@ -25,6 +25,43 @@ describe('createTranscriptTerminalSettle', () => {
     expect(proceed).toHaveBeenCalledTimes(1);
   });
 
+  it('holds past the bound while the transcript is mid tool cycle (#3702)', () => {
+    const proceed = vi.fn();
+    let mid = true;
+    let awaiting = true;
+    createTranscriptTerminalSettle({
+      awaitingTerminal: () => awaiting, midToolCycle: () => mid, timeoutMs: 2_000, pollMs: 100, maxHoldMs: 60_000,
+    }).request(proceed);
+    vi.advanceTimersByTime(30_000);
+    expect(proceed).not.toHaveBeenCalled(); // a premature "done" between two tools does not settle the turn
+    mid = false; // the final answer block landed (stop_reason end_turn) but the closing marker is still unread
+    vi.advanceTimersByTime(1_000);
+    expect(proceed).toHaveBeenCalledTimes(1);
+    awaiting = false;
+    vi.advanceTimersByTime(5_000);
+    expect(proceed).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops holding at maxHoldMs even if still mid tool cycle', () => {
+    const proceed = vi.fn();
+    createTranscriptTerminalSettle({
+      awaitingTerminal: () => true, midToolCycle: () => true, timeoutMs: 2_000, pollMs: 100, maxHoldMs: 10_000,
+    }).request(proceed);
+    vi.advanceTimersByTime(9_000);
+    expect(proceed).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(2_000);
+    expect(proceed).toHaveBeenCalledTimes(1);
+  });
+
+  it('a mid-cycle probe that throws finalizes as before', () => {
+    const proceed = vi.fn();
+    createTranscriptTerminalSettle({
+      awaitingTerminal: () => true, midToolCycle: () => { throw new Error('unreadable'); }, timeoutMs: 2_000, pollMs: 100,
+    }).request(proceed);
+    vi.advanceTimersByTime(2_200);
+    expect(proceed).toHaveBeenCalledTimes(1);
+  });
+
   it('gives up after the bound and finalizes anyway', () => {
     const proceed = vi.fn();
     createTranscriptTerminalSettle({ awaitingTerminal: () => true, timeoutMs: 2_000, pollMs: 100 }).request(proceed);

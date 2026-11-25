@@ -69,7 +69,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { closeSync, fstatSync, openSync, readSync, accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname, isAbsolute, resolve } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
@@ -13791,11 +13791,51 @@ let bridgeTranscriptGeneration = 0;
  *  lifecycle: requesting an idle wait disarms the watchdog (the idle edge's
  *  own settle takes over); cancel/proceed lets bridgeIngest re-arm it if the
  *  head is still waiting afterwards. */
+/** True while the Claude transcript's tail shows the turn is still inside its
+ *  tool cycle: the last assistant record stopped for `tool_use`, or a
+ *  tool_result was written after it (the next model call is in flight). Herdr
+ *  reports `done` and the screen can go quiet in exactly that gap (the API
+ *  request before the next block can take seconds), and settling then pops the
+ *  Lark turn with no answer; the real final lands later as a local turn and is
+ *  suppressed (#3702). Only for the Claude transcript bridge; any read or parse
+ *  problem says "not mid cycle" so behaviour falls back to the bounded settle. */
+function claudeTranscriptMidToolCycle(): boolean {
+  if (!bridgeJsonlPath || lastInitConfig?.cliId !== 'claude-code') return false;
+  let fd: number | undefined;
+  try {
+    fd = openSync(bridgeJsonlPath, 'r');
+    const size = fstatSync(fd).size;
+    const len = Math.min(size, 256 * 1024);
+    const buf = Buffer.alloc(len);
+    readSync(fd, buf, 0, len, size - len);
+    const lines = buf.toString('utf8').split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line.startsWith('{')) continue;
+      let rec: any;
+      try { rec = JSON.parse(line); } catch { continue; }
+      if (rec?.isMeta || rec?.isSidechain) continue;
+      if (rec?.type === 'assistant') return rec?.message?.stop_reason === 'tool_use';
+      if (rec?.type === 'user') {
+        const c = rec?.message?.content;
+        // A tool_result the model has not answered yet: still mid cycle. A real
+        // prompt (string / text blocks) means a new turn started: not ours.
+        return Array.isArray(c) && c.some((b: any) => b?.type === 'tool_result');
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) { try { closeSync(fd); } catch { /* ignore */ } }
+  }
+}
+
 function makeBridgeTranscriptSettle(
   awaitingTerminal: () => boolean,
   onTimeout?: () => void,
 ): TranscriptTerminalSettle {
-  const inner = createTranscriptTerminalSettle({ awaitingTerminal, onTimeout });
+  const inner = createTranscriptTerminalSettle({ awaitingTerminal, onTimeout, midToolCycle: claudeTranscriptMidToolCycle });
   return {
     request: (proceed: () => void): void => {
       disarmProvisionalExitWatch();

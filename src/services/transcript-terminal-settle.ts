@@ -28,6 +28,12 @@ export interface TranscriptTerminalSettleOptions {
   timeoutMs?: number;
   pollMs?: number;
   now?: () => number;
+  /** True while the transcript shows the CLI is still inside the turn's tool
+   *  cycle (its last record is a `tool_use` stop or a tool_result it has not
+   *  answered yet). A "finished" signal seen then is premature: keep waiting
+   *  past `timeoutMs`, up to `maxHoldMs`, instead of finalizing. May read. */
+  midToolCycle?: () => boolean;
+  maxHoldMs?: number;
 }
 
 export interface TranscriptTerminalSettle {
@@ -45,11 +51,15 @@ export interface TranscriptTerminalSettle {
  *  prompt-ready. */
 export const TRANSCRIPT_TERMINAL_SETTLE_TIMEOUT_MS = 2_000;
 export const TRANSCRIPT_TERMINAL_SETTLE_POLL_MS = 100;
+/** Upper bound for holding a premature "finished" while the transcript is mid
+ *  tool cycle: one model call between two tools can take minutes (thinking). */
+export const TRANSCRIPT_TERMINAL_SETTLE_MAX_HOLD_MS = 10 * 60_000;
 
 export function createTranscriptTerminalSettle(opts: TranscriptTerminalSettleOptions): TranscriptTerminalSettle {
   const timeoutMs = opts.timeoutMs ?? TRANSCRIPT_TERMINAL_SETTLE_TIMEOUT_MS;
   const pollMs = opts.pollMs ?? TRANSCRIPT_TERMINAL_SETTLE_POLL_MS;
   const now = opts.now ?? Date.now;
+  const maxHoldMs = opts.maxHoldMs ?? TRANSCRIPT_TERMINAL_SETTLE_MAX_HOLD_MS;
   let generation = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -68,8 +78,13 @@ export function createTranscriptTerminalSettle(opts: TranscriptTerminalSettleOpt
         if (mine !== generation) return;
         let waiting = false;
         try { waiting = opts.awaitingTerminal(); } catch { /* unreadable transcript: finalize as before */ }
-        if (waiting && now() - startedAt < timeoutMs) {
-          timer = setTimeout(tick, pollMs);
+        const elapsed = now() - startedAt;
+        let holding = false;
+        if (waiting && elapsed >= timeoutMs && elapsed < maxHoldMs && opts.midToolCycle) {
+          try { holding = opts.midToolCycle(); } catch { /* unreadable: finalize as before */ }
+        }
+        if (waiting && (elapsed < timeoutMs || holding)) {
+          timer = setTimeout(tick, holding ? Math.max(pollMs, 500) : pollMs);
           timer.unref?.();
           return;
         }
